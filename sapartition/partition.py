@@ -91,7 +91,7 @@ class Partitioned(object):
     @classmethod
     def def_partition(cls, partition_name, constraint=None, **definition):
         if cls.__partitions__ is None:
-            cls.__partitions__ = OrderedDict
+            cls.__partitions__ = OrderedDict()
 
         if partition_name is cls.__partitions__:
             raise ValueError("Cannot redefine partition: {}".format(partition_name))
@@ -147,7 +147,7 @@ class Partitioned(object):
     @classmethod
     def partition_defined(cls, name):
         if cls.__partitions__ is None:
-            cls.__partitions__ = OrderedDict
+            cls.__partitions__ = OrderedDict()
 
         return name in cls.__partitions__
 
