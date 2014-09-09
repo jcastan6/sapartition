@@ -8,7 +8,7 @@ import itertools
 import sys
 from pprint import pprint
 
-from sqlalchemy.schema import Table, Column
+from sqlalchemy.schema import Table, Column, CreateTable
 from sqlalchemy.sql.expression import Alias
 from sqlalchemy.ext.compiler import compiles
 
@@ -42,19 +42,22 @@ def _find_subelement_replacements(element, tables_with_new=True, parameters_with
         new = "NEW.{}".format(element.name)
         names.add((old, new))
     return names
-            
 
 
 class Partition(object):
     """Represents a 'table partition'."""
-    @classmethod
-    def get_create_ddl(cls):
-        create = str(CreateTable(cls.__table__))
-        create = create.replace('CREATE TABLE', 'CREATE TABLE IF NOT EXISTS')
-        create = text("{create} INHERETS {parent}".format(create=create.strip(),
-                                                          parent=cls.__parenttable__))
-        return create
+    pass
 
+
+@compiles(CreateTable, 'postgresql')
+def create_partition_table(create, compiler, **kwargs):
+    parent_table = getattr(create.element, '__parenttable__', None)
+    create_ddl = compiler.visit_create_table(create, **kwargs)
+    if parent_table is not None:
+        parent_name = parent_table.fullname
+        create_ddl = "{create} INHERITS ({parent})".format(create=create_ddl,
+                                                          parent=parent_name)
+    return create_ddl
     
         
 @compiles(Partition)
@@ -140,7 +143,7 @@ class Partitioned(object):
         else:
             constraint_clause = None
         setattr(partition, '__partitionconstraint__', constraint_clause)
-
+        setattr(partition.__table__, '__parenttable__', partition.__parenttable__)
 
         return partition
 
