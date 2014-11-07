@@ -19,6 +19,85 @@ from sqlalchemy.orm.session import Session
 from sqlalchemy.ext.declarative import *
 
 
+def replace(old, new):
+        replacer = PartitionReplacer(old.__table__).set_replacement(new.__table__)
+        old_mapper = old.__mapper__
+        new_mapper = new.__mapper__
+        def transform(original):
+                query = original.filter()
+                query.__dict__.update({
+                        '_criterion': replacement_traverse(query.__dict__['_criterion'], {}, replacer),
+                        '_from_obj': tuple(replacement_traverse(fo, {}, replacer) for fo in query.__dict__['_from_obj']),
+                        '_join_entities': tuple(new_mapper if ent is old_mapper else ent for ent in query.__dict__['_join_entities']),
+                        '_joinpoint': {k: new if v is old else v for k,v in query.__dict__['_joinpoint'].items()},
+                })
+                return query
+        return transform
+
+
+def replace_table(old_table, new_table):
+    replacer = PartitionReplacer(old_table, new_table)
+    def transform(original):
+        query = original.filter()  # Copy query
+
+        # Determine internal replacements
+        criterion = replacer.apply(query._criterion)
+        from_obj = tuple(replacer.apply(obj) for obj in query._from_obj)
+
+        # Apply replacements to internal query structure
+        query.__dict__.update(_criterion=criterion,
+                              _from_obj=from_obj)
+
+        return query
+    return transform
+
+
+def replace_entity(old_cls, new_cls):
+    old_table = old_cls.__table__
+    old_map = old_cls.__mapper__
+    new_table = new_cls.__table__
+    new_map = new_cls.__mapper__
+
+    def transform(original):
+        query = original.with_transformation(replace_table(old_table, new_table))
+        join_entities = tuple(new_map if ent is old_map else ent for ent in query._join_entities)
+        joinpoint = dict((k, new_cls if v is old_cls else v) for k, v in query._joinpoint.items())
+
+        # Apply replacements to internal query structure
+        query.__dict__.update(_join_entities=join_entities,
+                              _joinpoint=joinpoint)
+        return query
+    return transform
+
+
+class PartitionReplacer(object):
+    def __init__(self, search, replacement=None):
+        self.search = search
+        self.replacement = replacement
+
+    def set_replacement(self, replacement):
+        self.replacement = replacement
+        return self
+
+    def __call__(self, elem):
+        # Replace instances of columns
+        try:
+            table = elem.table
+            name = elem.name
+            if table is self.search:
+                replace = getattr(self.replacement.columns, name)
+                return replace
+        except AttributeError:
+            pass
+        # Replace instances of table
+        if elem is self.search:
+            return self.replacement
+        return None
+
+    def apply(self, target, options={}):
+        return replacement_traverse(target, options, self)
+
+
 def _find_subelement_replacements(element, tables_with_new=True, parameters_with_values=True):
     names = set()
     if hasattr(element, 'params') and parameters_with_values:
@@ -46,7 +125,17 @@ def _find_subelement_replacements(element, tables_with_new=True, parameters_with
 
 class Partition(object):
     """Represents a 'table partition'."""
-    pass
+
+    def mock_parent(self):
+        return PartitionAlias(self, __parenttable__.fullname)
+
+
+class PartitionAlias(Alias):
+
+    def alias(self, name):
+        a = Alias(self, name)
+        a.original = self
+        return a
 
 
 @compiles(CreateTable, 'postgresql')
@@ -60,7 +149,7 @@ def create_partition_table(create, compiler, **kwargs):
     return create_ddl
     
         
-@compiles(Partition)
+@compiles(PartitionAlias)
 def visit_partition(element, compiler, **kw):
     if kw.get('asfrom'):
         return element.name
@@ -92,7 +181,14 @@ class Partitioned(object):
     __partitions__ = None
 
     @classmethod
-    def def_partition(cls, partition_name, constraint=None, **definition):
+    def get_partition(cls, partition_name, constraint=None, **definition):
+        try:
+            return cls.__partitions__[partition_name]
+        except KeyError:
+            return cls.define_partition(partition_name, constraint, **definition)
+
+    @classmethod
+    def define_partition(cls, partition_name, constraint=None, **definition):
         if cls.__partitions__ is None:
             cls.__partitions__ = OrderedDict()
 
@@ -162,7 +258,6 @@ class Partitioned(object):
         if getattr(cls, '__generate_partitions__', None) is not None and not cls.__partitions_loaded__:
             cls.__generate_partitions__()
             cls.__partitions_loaded__ = True
-    
 
     @classmethod
     def partitions(cls):
@@ -294,7 +389,7 @@ def test():
             for low, high in cls.test_parts:
                 name = "{0}_{1}".format(low, high)
                 check = lambda cls: (cls.id >= low) & (cls.id < high)
-                part = cls.def_partition(name, constraint=check, ID_LOWER_BOUND=low, ID_UPPER_BOUND=high)
+                part = cls.define_partition(name, constraint=check, ID_LOWER_BOUND=low, ID_UPPER_BOUND=high)
 
         
     for part in Fingerprint.partitions():
