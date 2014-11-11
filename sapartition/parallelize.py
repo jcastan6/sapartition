@@ -58,7 +58,9 @@ class ParallelizedQuery(object):
                  backend=DEFAULT_BACKEND, 
                  pool=None, 
                  spawn_context=no_context,
-                 spawn_transformation=None):
+                 spawn_transformation=None,
+                 swap_to_original_session=True,
+                 preprocess_result=lambda row: row):
         self.queries = queries
         self.original_query = original_query
 
@@ -68,6 +70,23 @@ class ParallelizedQuery(object):
         self._backend = backend
         self._spawn_transformation = spawn_transformation
         self._spawn_contextmanager = spawn_context
+
+        if swap_to_original_session:
+            _preprocess_result = preprocess_result
+            def preprocess_result(query, row):
+           
+                try:
+                    query.session.expunge(row)
+                except ProgrammingError:
+                    pass
+                try:
+                    self.original_query.session.add(row)
+                except AssertionError:
+                    # This is probably not the right thing to do
+                    pass
+                return _preprocess_result(row)
+
+        self._preprocess_result = preprocess_result
 
         self._pool = pool
 
@@ -80,11 +99,11 @@ class ParallelizedQuery(object):
     def _spawn_callback_query_results(self, (input_query, callback)):
         with self._spawnned_query_instance(input_query) as query:
             for result in query:
-                callback(result)
+                callback(self._preprocess_result(query, result))
     
     def _spawn_load_all_results(self, input_query):
         with self._spawnned_query_instance(input_query) as query:
-            results = query.all()
+            results = [self._preprocess_result(query, row) for row in query.all()]
         return results
 
     def _spawner(self, target, args=None):
