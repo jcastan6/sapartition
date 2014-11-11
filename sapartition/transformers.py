@@ -4,7 +4,7 @@ import contextlib
 from sqlalchemy.orm import sessionmaker, scoped_session
 from sqlalchemy.orm import scoped_session
 
-sessionmaker_ = sessionmaker
+sessionmakertype_ = sessionmaker
 
 
 @contextlib.contextmanager
@@ -20,31 +20,20 @@ def close_session_connection(q):
         q.session.connection().close()
 
 
-def pooled_sessionmaker(pool, sessionmaker=sessionmaker_):
+def pooled_sessionmaker(pool, sessionmakertype=sessionmakertype_):
     def factory(*args,**kwargs):
         connection = pool.connect()
-        session = sessionmaker(bind=connection)
+        session = sessionmakertype(bind=connection)
         return session
     return factory
 
 
-def use_new_scoped_session(sessionmaker=sessionmaker_):
+def use_new_scoped_session(sessionmakertype=sessionmakertype_):
     def transform(original):
-        Session = scoped_session(sessionmaker())
+        Session = scoped_session(sessionmakertype())
         query = original.with_session(Session())
         return query
     return transform
-
-
-def close_on_finish(future, query):
-    query.session.connection().close()
-
-
-def transform_and_execute(query, transform, context=no_context):
-    transformed = query.with_transformation(transform)
-    with context(transformed):
-        for result in transformed:
-            yield result
 
 
 def chain_transformations(*transformers):
@@ -54,6 +43,13 @@ def chain_transformations(*transformers):
             query = query.with_transformation(transformer)
         return query
     return transform
+
+
+def transform_and_execute(query, transform, context=no_context):
+    transformed = query.with_transformation(transform)
+    with context(transformed):
+        for result in transformed:
+            yield result
 
 
 def transform_in_new_session(transform_session, inner_transform):

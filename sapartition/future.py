@@ -34,17 +34,18 @@ joins the main thread and it has blocked until its execution has finished.
 References
 ==========
 """
-from collections import deque
 
 USE_GREEN_THREADS = True
 try:
     if not USE_GREEN_THREADS:
         raise ImportError("Manual fallback to threading")
     import gevent
+    from gevent.queue import Queue
     spawner = gevent.Greenlet.spawn
     joiner = gevent.Greenlet.join
 except ImportError:
     import threading
+    from queue import Queue
     joiner = threading.Thread.join
     def spawner(fn):
         thread = threading.Thread(target=fn)
@@ -95,36 +96,46 @@ class Future(object):
        method of :class:`Query` like :meth:`~Query.filter()`.
     """
 
-    __slots__ = "query", "_iter", "_buffer", "_thread", "_transform", '_callback', '_join'
+    __slots__ = "query", 'buffer', "_iter", "_thread", "_transform", '_callback', '_join', '_queue'
 
-    def __init__(self, query, transform=None, callback=None, load_all=True, spawn=spawner, join=joiner):
+    def __init__(self, query, transform=None, 
+                              callback=None, 
+                              fill_buffer=True, 
+                              spawn=spawner, 
+                              join=joiner, 
+                              queue=Queue):
         self.query = query
+        self.buffer = EMPTY
         self._iter = None
-        self._buffer = EMPTY
         self._transform = transform
         self._callback = callback
-        if load_all:
-            target = self.execute_promise_all
+        if fill_buffer:
+            target = self.execute_promise_and_fill
         else:
             target = self.execute_promise
         self._thread = spawn(target)
         self._join = joiner
+        self._queue = queue
 
     def execute_promise(self):
         if self._transform is not None:
             self.query = self.query.with_transformation(self._transform)
 
         self._iter = iter(self.query)
+        self.buffer = self._queue()
         try:
-            self._buffer = deque([next(self._iter)])
+            self.buffer.put(next(self._iter))
         except StopIteration:
-            self._buffer = EMPTY
+            self.buffer = EMPTY
 
-    def execute_promise_all(self):
-        self.execute_promise()
+    def fill_buffer(self):
         for value in self._iter:
-            self._buffer.append(value)
+            self.buffer.put(value)
         self._done()
+
+    def execute_promise_and_fill(self):
+        self.execute_promise()
+        self.fill_buffer()
 
     def _done(self):
         if self._iter is not None:
@@ -133,13 +144,13 @@ class Future(object):
                 self._callback(self, self.query)
 
     def __iter__(self):
-        if self._iter is None or self._buffer is EMPTY:
+        if self._iter is None or self.buffer is EMPTY:
             self._join(self._thread)
         def gen():
-            if self._buffer is not EMPTY:
+            if self.buffer is not EMPTY:
                 try:
                     while True:
-                        yield self._buffer.popleft()
+                        yield self.buffer.get()
                 except IndexError:
                     pass
             if self._iter is not None:
@@ -147,6 +158,9 @@ class Future(object):
                     yield value
             self._done()
         return gen()
+
+    def fulfilled(self):
+        return self._iter is None and not self._thread
 
     def all(self):
         """Returns the results promised as a :class:`list`. This blocks the
@@ -156,3 +170,4 @@ class Future(object):
         :rtype: :class:`list`
         """
         return list(self)
+
