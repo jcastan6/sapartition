@@ -30,7 +30,7 @@ def pooled_sessionmaker(pool, sessionmakertype=sessionmakertype_):
 
 def use_new_scoped_session(sessionmakertype=sessionmakertype_):
     def transform(original):
-        Session = scoped_session(sessionmakertype())
+        Session = scoped_session(sessionmakertype)
         query = original.with_session(Session())
         return query
     return transform
