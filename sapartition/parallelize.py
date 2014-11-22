@@ -14,6 +14,7 @@ DONE_EXCEPTIONS = (StopIteration,)
 _QUERY_PART_DONE = object()
 
 try:
+    raise ImportError()
     from multiprocessing.pool import ThreadPool
     from Queue import Queue as ThreadQueue
     from Queue import Empty as ThreadQueueEmpty
@@ -27,10 +28,11 @@ except ImportError:
 try:
     from gevent.monkey import saved as gevent_patched
     from gevent.pool import Pool as GeventPool
+    from gevent.pool import Group as GeventGroup
     from gevent.queue import Queue as GeventQueue
     from gevent.hub import LoopExit as GeventLoopExit
     DONE_EXCEPTIONS += (GeventLoopExit,)
-    GEVENT_BACKEND = (GeventPool, GeventQueue)
+    GEVENT_BACKEND = (GeventGroup, GeventQueue)
     BACKENDS['gevent'] = GEVENT_BACKEND
     if 'socket' in gevent_patched or 'sys' in gevent_patched:
         DEFAULT_BACKEND = GEVENT_BACKEND
@@ -111,13 +113,20 @@ def apply_deferred_transformations(query, save=False):
     return transformed
 
 
+def deferred_transformation(transformation):
+    def immediate_tranform(original):
+        query = original._clone()
+        setattr(query, '_deferred_transformations', 
+                getattr(query, '_deferred_transformations', ()) + (transformation,))
+        return query
+    return immediate_tranform
+
+
 class ParallelizableQueryMixin(object):
     _deferred_transformations = ()
 
     def with_deferred_transformation(self, transformation):
-        query = self.filter()
-        query._deferred_transformations += (transformation,)
-        return query
+        return self.with_transformation(deferred_transformation(transformation))
 
     def apply_deferred_transformations(self):
         return apply_deferred_transformations(self)
@@ -227,9 +236,10 @@ class ParallelizedQuery(object):
 
     def _iter_queue(self):
         if self._limit is not None:
-            allowed = self._limit[0]
+            print "LIMITED"
+            _start, allowed = self._limit
         else:
-            allowed = None
+            _start, allowed = None, None
         finished = 0
         expected = self._num_query_parts()
         tasks, results = self._queue_spawner()
@@ -244,6 +254,7 @@ class ParallelizedQuery(object):
                             allowed -= 1
                             yield item
                         else:
+                            print "DONE DONE DONE DONE DONE DONE DONE"
                             tasks.close()
                             break
                     else:
@@ -286,9 +297,10 @@ class ParallelizedQuery(object):
     def session(self):
         return self.original_query.session
 
-    def limit(size):
-        new = self._apply_over_queries('limit', size)
-        new._limit = (0, size)
+    def slice(self, start, size):
+        new = self._apply_over_queries('slice', start, size)
+        new._limit = (start, size)
+        return new
 
     def _apply_over_queries(self, name, *args, **kwargs):
         apply_proxy = lambda q: getattr(q, name)(*args, **kwargs)
