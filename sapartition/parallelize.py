@@ -32,10 +32,11 @@ try:
     from gevent.queue import Queue as GeventQueue
     from gevent.hub import LoopExit as GeventLoopExit
     DONE_EXCEPTIONS += (GeventLoopExit,)
-    GEVENT_BACKEND = (GeventGroup, GeventQueue)
+    GEVENT_BACKEND = (GeventPool, GeventQueue)
     BACKENDS['gevent'] = GEVENT_BACKEND
     if 'socket' in gevent_patched or 'sys' in gevent_patched:
         DEFAULT_BACKEND = GEVENT_BACKEND
+        print "GEVENT ENABLED"
 except ImportError:
     GEVENT_BACKEND = None
 
@@ -236,7 +237,6 @@ class ParallelizedQuery(object):
 
     def _iter_queue(self):
         if self._limit is not None:
-            print "LIMITED"
             _start, allowed = self._limit
         else:
             _start, allowed = None, None
@@ -254,8 +254,10 @@ class ParallelizedQuery(object):
                             allowed -= 1
                             yield item
                         else:
-                            print "DONE DONE DONE DONE DONE DONE DONE"
-                            tasks.close()
+                            try:
+                                tasks.close()
+                            except AttributeError:
+                                pass
                             break
                     else:
                         yield item

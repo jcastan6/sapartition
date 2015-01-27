@@ -1,8 +1,10 @@
 import time
 import contextlib
 
-from sqlalchemy.orm import sessionmaker, scoped_session
-from sqlalchemy.orm import scoped_session
+from sqlalchemy.orm import (
+    scoped_session,
+    sessionmaker, 
+)
 
 sessionmaker_ = sessionmaker
 
@@ -22,22 +24,31 @@ def close_session_connection(q):
 
 def pooled_sessionmaker(pool, sessionmaker=sessionmaker_):
     def factory(*args,**kwargs):
-        connection = pool.connect()
-        session = sessionmaker(bind=connection)
+        if 'bind' not in kwargs:
+            kwargs['bind'] = pool.connect()
+        session = sessionmaker(**kwargs)
         return session
     return factory
 
 
-def use_new_scoped_session(sessionmaker=sessionmaker_):
+def use_new_session(sessionmaker=sessionmaker_):
     def transform(original):
-        Session = scoped_session(sessionmaker())
-        query = original.with_session(Session())
+        Session = sessionmaker()
+        query = original.with_session(Session)
         return query
     return transform
 
 
+def use_new_scoped_session(sessionmaker=sessionmaker_):
+    scoped_sessionmaker = lambda: scoped_session(sessionmaker)
+    transform = use_new_session(scoped_sessionmaker)
+    return transform
+
+
 def close_on_finish(future, query):
-    query.session.connection().close()
+    session = query.session
+    connection = session.connection()
+    connection.close()
 
 
 def transform_and_execute(query, transform, context=no_context):
