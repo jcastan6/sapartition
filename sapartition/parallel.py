@@ -18,8 +18,14 @@ def no_context(q):
 def close_session_connection(q):
     try:
         yield q
+    except Exception as e:
+        raise
     finally:
-        q.session.connection().close()
+        try:
+            connection = q.session.bind
+            connection.close()
+        except AttributeError:
+            pass
 
 
 def pooled_sessionmaker(pool, sessionmaker=sessionmaker_):

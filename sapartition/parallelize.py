@@ -14,7 +14,6 @@ DONE_EXCEPTIONS = (StopIteration,)
 _QUERY_PART_DONE = object()
 
 try:
-    raise ImportError()
     from multiprocessing.pool import ThreadPool
     from Queue import Queue as ThreadQueue
     from Queue import Empty as ThreadQueueEmpty
@@ -36,7 +35,6 @@ try:
     BACKENDS['gevent'] = GEVENT_BACKEND
     if 'socket' in gevent_patched or 'sys' in gevent_patched:
         DEFAULT_BACKEND = GEVENT_BACKEND
-        print "GEVENT ENABLED"
 except ImportError:
     GEVENT_BACKEND = None
 
@@ -107,6 +105,7 @@ def define_bounds_transformations(column, step=1000000, start=1, end=None):
 def apply_deferred_transformations(query, save=False):
     transformed = query
     if hasattr(query, '_deferred_transformations'):
+        transformed = query._clone()
         for transformation in query._deferred_transformations:
             transformed = transformed.with_transformation(transformation)
         if query is not transformed and not save:
@@ -123,15 +122,24 @@ def deferred_transformation(transformation):
     return immediate_tranform
 
 
+#class DeferredTransformationsQueryMixin(object):
+#    _deferred_transformations = ()
+#
+#    def with_deferred_transformation(self, transformation):
+#        return self.with_transformation(deferred_transformation(transformation))
+#
+#    def apply_deferred_transformations(self):
+#        return apply_deferred_transformations(self)
+#
+#    def __iter__(self):
+#        if len(self._deferred_transformations) > 0:
+#            new_self = self.apply_deferred_transformations()
+#            return super(DeferredTransformationsQueryMixin, new_self).__iter__()
+#        else:
+#            return super(DeferredTransformationsQueryMixin, self).__iter__() 
+
+
 class ParallelizableQueryMixin(object):
-    _deferred_transformations = ()
-
-    def with_deferred_transformation(self, transformation):
-        return self.with_transformation(deferred_transformation(transformation))
-
-    def apply_deferred_transformations(self):
-        return apply_deferred_transformations(self)
-
     def fork_with_transformations(self, transformations):
         return [self.with_transformation(transform) for transform in transformations]
 
@@ -164,33 +172,60 @@ class ParallelizedQuery(object):
                 # There HAS to be a better way to add these results to an 
                 # existing session safely
                 try:
-                    query.session.expunge(row)
-                except ProgrammingError:
+                    self.original_query.session.merge(row, load=False)
+                except AssertionError as e:
+                    # This is probably not the right thing to do
                     pass
                 try:
-                    self.original_query.session.add(row)
-                except AssertionError:
-                    # This is probably not the right thing to do
+                    query.session.expunge(row)
+                except ProgrammingError as e:
                     pass
                 return _preprocess_result(row)
 
         self._preprocess_result = preprocess_result
         self._pool = pool
         self._limit = None
+        self._seen = 0
+        self._stop = False
+        self.__pool = None
+        self.__tasks = None
 
     def _num_query_parts(self):
         return len(self.queries)
 
     def _spawnned_query_instance(self, query):
-        if self._spawn_transformation is not None:
-            query = query.with_transformation(self._spawn_transformation)
-        query_context = self._spawn_contextmanager(query)
+        if self._stop:
+            query_context = no_context(())
+        else:
+            if self._spawn_transformation is not None:
+                query = query.with_transformation(self._spawn_transformation)
+            query_context = self._spawn_contextmanager(query)
         return query_context
 
     def _spawn_callback_query_results(self, (input_query, callback)):
+        if self._stop:
+            return 
+
+        if self._limit is not None:
+            def counting_callback(result):
+                if self._seen >= self._limit:
+                    raise StopIteration
+                callback(result)
+                self._seen += 1
+            result_callback = counting_callback
+        else:
+            result_callback = callback
+
         with self._spawnned_query_instance(input_query) as query:
-            for result in query:
-                callback(self._preprocess_result(query, result))
+            results = iter(query)
+            for result in results:
+                try:
+                    preprocessed = self._preprocess_result(query, result)
+                    result_callback(preprocessed)
+                except StopIteration:
+                    results.close()
+                    self._terminate()
+                    break
             callback(_QUERY_PART_DONE)
     
     def _spawn_load_all_results(self, input_query):
@@ -198,6 +233,20 @@ class ParallelizedQuery(object):
             results = [self._preprocess_result(query, row) for row in query.all()]
         results.append(_QUERY_PART_DONE)
         return results
+
+    def _discard_errors(self, fn):
+        def wrapped(*args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except Exception as e:
+                raise
+                pass
+        return wrapped
+
+    def _terminate(self):
+        if self.__tasks:
+            self.__tasks.kill()
+        self._stop = True
 
     def _spawner(self, target, args=None):
         poolclass, _ = self._backend
@@ -209,19 +258,33 @@ class ParallelizedQuery(object):
             pool = self._pool
         if args is None:
             args = self.queries
+	self.__pool = pool
         tasks = pool.imap_unordered(target, args)
-        return tasks
+        self.__tasks = tasks
+        def handler(thread):
+            exc = thread.exception
+            if exc in DONE_EXCEPTIONS:
+                self._terminate()
+        tasks.link_exception(handler)
+        return tasks, pool
 
     def _spawn_with_callback(self, callback):
-        args = [(query, callback) for query in self.queries]
-        tasks = self._spawner(self._spawn_callback_query_results, args)
-        return tasks
+        def gen_args():
+            for query in self.queries:
+                if self._stop:
+                    break
+                else:
+                    yield (query, callback)
+        runner = self._spawn_callback_query_results
+        catcher = self._discard_errors(runner)
+        tasks, pool = self._spawner(catcher, gen_args())
+        return tasks, pool
 
     def _queue_spawner(self):
         _, queueclass = self._backend
         results = queueclass()
-        tasks = self._spawn_with_callback(results.put)
-        return tasks, results
+        tasks, pool = self._spawn_with_callback(results.put)
+        return tasks, results, pool
 
     def all_per_query(self):
         tasks = self._spawner(self._spawn_load_all_results)
@@ -232,41 +295,35 @@ class ParallelizedQuery(object):
         return [result for results in per_query for result in results if result is not _QUERY_PART_DONE]
 
     def result_queue(self):
-        tasks, results = self._queue_spawner()
+        tasks, results, pool = self._queue_spawner()
         return results
 
     def _iter_queue(self):
-        if self._limit is not None:
-            _start, allowed = self._limit
-        else:
-            _start, allowed = None, None
         finished = 0
+        sent = 0
         expected = self._num_query_parts()
-        tasks, results = self._queue_spawner()
+        tasks, results, pool = self._queue_spawner()
         while True:
             try:
-                if finished < expected:
-                    item = results.get()
-                    if item is _QUERY_PART_DONE:
-                        finished += 1
-                    elif allowed is not None:
-                        if allowed > 0:
-                            allowed -= 1
-                            yield item
-                        else:
-                            try:
-                                tasks.close()
-                            except AttributeError:
-                                pass
-                            break
-                    else:
-                        yield item
-                else:
+                if finished >= expected:
                     break
-            # See if we can wait for another task to finish
-            except DONE_EXCEPTIONS:
-                if finished >= expected:  # Should never be greater than 
-                    break                 # Just in case
+                elif self._stop:
+                    break
+                item = results.get()
+                if item is _QUERY_PART_DONE:
+                    finished += 1
+                    
+                    continue
+                elif self._limit is not None:
+                    if sent <= self._limit:
+                        sent += 1
+                    else:
+                        break
+                yield item
+            except DONE_EXCEPTIONS as e:
+                break
+        tasks.kill()
+        pool.kill()
 
     def _iter_normal(self):
         finished = 0
@@ -284,33 +341,40 @@ class ParallelizedQuery(object):
         else:
             return self._iter_queue()
 
-    def new_with_parallel_config(self, queries, original_query=None):
+    def new_with_parallel_config(self, queries, original_query=None, **kwargs):
         cls = type(self)
         if original_query is None:
             original_query = self.original_query
-        return cls(queries, 
-                   original_query,
-                   backend=self._backend,
-                   pool=self._pool,
-                   spawn_context=self._spawn_contextmanager,
-                   spawn_transformation=self._spawn_transformation)
+        inst = cls(queries, original_query)
+        conf = self.__dict__.copy()
+        conf.pop('queries')
+        conf.pop('original_query')
+        inst.__dict__.update(conf)
+        inst.__dict__.update(kwargs)
+        return inst
 
     @property
     def session(self):
         return self.original_query.session
 
     def slice(self, start, size):
-        new = self._apply_over_queries('slice', start, size)
-        new._limit = (start, size)
+        new = self._apply_over_queries('slice', start, size, 
+                                       init_kwargs={'_limit': size})
+        return new
+
+    def limit(self, limit):
+        new = self._apply_over_queries('limit', limit, 
+                                       init_kwargs={'_limit': limit})
         return new
 
     def _apply_over_queries(self, name, *args, **kwargs):
+        init_kwargs = kwargs.pop('init_kwargs', {})
         apply_proxy = lambda q: getattr(q, name)(*args, **kwargs)
         original_query = apply_proxy(self.original_query)
         queries = []
         for query in self.queries:
             queries.append(apply_proxy(query))
-        parallel_query = self.new_with_parallel_config(queries, original_query)
+        parallel_query = self.new_with_parallel_config(queries, original_query, **init_kwargs)
         return parallel_query
 
     def __getattr__(self, name):
