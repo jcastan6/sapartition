@@ -85,13 +85,15 @@ def transformations_from_constraints(constraints):
 
 
 def define_bounds(column, step=1000000, start=1):
-    def factory(session):
+    def factory(query, session=None):
+        session = session or query.session
         bounds = bounds_to_max(session, column, step=step, start=start)
     return bound_factory
 
 
 def define_bounds_transformations(column, step=1000000, start=1, end=None):
-    def factory(session):
+    def factory(query, session=None):
+        session = session or query.session
         if end is None:
             bounds = bounds_to_max(session, column, step=step, start=start)
         else:
@@ -195,7 +197,7 @@ class ParallelizedQuery(object):
 
     def _spawnned_query_instance(self, query):
         if self._stop:
-            query_context = no_context(())
+            query_context = no_context(None)
         else:
             if self._spawn_transformation is not None:
                 query = query.with_transformation(self._spawn_transformation)
@@ -258,7 +260,7 @@ class ParallelizedQuery(object):
             pool = self._pool
         if args is None:
             args = self.queries
-	self.__pool = pool
+        self.__pool = pool
         tasks = pool.imap_unordered(target, args)
         self.__tasks = tasks
         def handler(thread):
@@ -380,7 +382,14 @@ class ParallelizedQuery(object):
     def __getattr__(self, name):
         if not hasattr(self.original_query, name):
             raise AttributeError("{} not available in original query. Will not map over query parts".format(name))
+        if not callable(getattr(self.original_query, name)):
+            return getattr(self.original_query, name)
         def proxy(*args, **kwargs):
+            original_fn = getattr(self.original_query, name)
+            original_result = original_fn(*args, **kwargs)
+            # If the function was an accessor instead of a chained builder
+            if not isinstance(original_result, type(self.original_query)):
+                return original_result
             return self._apply_over_queries(name, *args, **kwargs)
         return proxy
 
