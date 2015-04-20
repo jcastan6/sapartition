@@ -173,16 +173,11 @@ class ParallelizedQuery(object):
             def preprocess_result(query, row):
                 # There HAS to be a better way to add these results to an 
                 # existing session safely
-                try:
-                    self.original_query.session.merge(row, load=False)
-                except AssertionError as e:
-                    # This is probably not the right thing to do
-                    pass
-                try:
-                    query.session.expunge(row)
-                except ProgrammingError as e:
-                    pass
-                return _preprocess_result(row)
+                query.session.expunge(row)
+                merged = self.session.merge(row, load=False)
+
+                del row
+                return _preprocess_result(merged)
 
         self._preprocess_result = preprocess_result
         self._pool = pool
