@@ -167,7 +167,7 @@ class ParallelizedQuery(object):
                  spawn_context=no_context,
                  spawn_transformation=None,
                  swap_to_original_session=True,
-                 preprocess_result=lambda row: row):
+                 preprocess_result=lambda query, row: row):
         self.queries = queries
         self.original_query = original
 
@@ -178,16 +178,7 @@ class ParallelizedQuery(object):
         self._spawn_transformation = spawn_transformation
         self._spawn_contextmanager = spawn_context
 
-        if swap_to_original_session:
-            _preprocess_result = preprocess_result
-            def preprocess_result(query, row):
-                # There HAS to be a better way to add these results to an 
-                # existing session safely
-                query.session.expunge(row)
-                merged = self.session.merge(row, load=False)
-
-                del row
-                return _preprocess_result(merged)
+        self._swap_to_original_session = swap_to_original_session
 
         self._preprocess_result = preprocess_result
         self._pool = pool
@@ -249,6 +240,7 @@ class ParallelizedQuery(object):
                     break
             callback(_QUERY_PART_DONE)
             self._executing[query_idx] = None
+            query.session.expunge_all()
     
     def _spawn_load_all_results(self, input_query):
         with self._spawnned_query_instance(input_query) as query:
@@ -393,9 +385,12 @@ class ParallelizedQuery(object):
 
     def __iter__(self):
         if hasattr(self._backend[1], '__iter__') and False:
-            return self._iter_normal()
+            it = self._iter_normal()
         else:
-            return self._iter_queue()
+            it = self._iter_queue()
+        if self._swap_to_original_session:
+            it = (self.session.merge(result, load=False) for result in it)
+        return it
 
     def new_with_parallel_config(self, queries, original_query=None, **kwargs):
         cls = type(self)
