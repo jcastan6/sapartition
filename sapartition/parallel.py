@@ -15,23 +15,23 @@ def no_context(q):
 
 
 @contextlib.contextmanager
-def close_session_connection(q):
+def close_session_connection(query):
     try:
-        yield q
-    except Exception as e:
-        raise
+        yield query
     finally:
         try:
-            connection = q.session.bind
-            connection.close()
-        except AttributeError:
+            query.session.rollback()
+        except Exception:
+            pass
+        try:
+            query.session.close()
+        except Exception:
             pass
 
 
 def pooled_sessionmaker(pool, sessionmaker=sessionmaker_):
     def factory(*args,**kwargs):
-        if 'bind' not in kwargs:
-            kwargs['bind'] = pool.connect()
+        kwargs.setdefault('bind', pool)
         session = sessionmaker(**kwargs)
         return session
     return factory

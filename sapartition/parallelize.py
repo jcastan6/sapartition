@@ -1,7 +1,12 @@
+from __future__ import division
 import contextlib
 import itertools
 
 from sqlalchemy import func
+from sqlalchemy.orm.exc import (
+    NoResultFound,
+    MultipleResultsFound,
+)
 
 
 # A backend is a tuple of a "pool" class and a "queue" class
@@ -14,24 +19,26 @@ DONE_EXCEPTIONS = (StopIteration,)
 _QUERY_PART_DONE = object()
 
 try:
+    import time
     from multiprocessing.pool import ThreadPool
     from Queue import Queue as ThreadQueue
     from Queue import Empty as ThreadQueueEmpty
     DONE_EXCEPTIONS += (ThreadQueueEmpty,)
-    THREADING_BACKEND = (ThreadPool, ThreadQueue)
+    THREADING_BACKEND = (ThreadPool, ThreadQueue, time.sleep)
     BACKENDS['threading'] = THREADING_BACKEND
     DEFAULT_BACKEND = THREADING_BACKEND
 except ImportError:
     THREADING_BACKEND = None
 
 try:
+    import gevent
     from gevent.monkey import saved as gevent_patched
     from gevent.pool import Pool as GeventPool
     from gevent.pool import Group as GeventGroup
     from gevent.queue import Queue as GeventQueue
     from gevent.hub import LoopExit as GeventLoopExit
     DONE_EXCEPTIONS += (GeventLoopExit,)
-    GEVENT_BACKEND = (GeventPool, GeventQueue)
+    GEVENT_BACKEND = (GeventPool, GeventQueue, gevent.sleep)
     BACKENDS['gevent'] = GEVENT_BACKEND
     if 'socket' in gevent_patched or 'sys' in gevent_patched:
         DEFAULT_BACKEND = GEVENT_BACKEND
@@ -49,7 +56,7 @@ def close_session_connection(query):
     try:
         yield query
     finally:
-        query.session.connection().close()
+        query.session.remove()
 
 
 def pairwise(iterable):
@@ -147,7 +154,10 @@ class ParallelizableQueryMixin(object):
 
     def parallelize_with_transformations(self, transformations, **kwargs):
         queries = self.fork_with_transformations(transformations)
-        return ParallelizedQuery(queries, original=self, **kwargs)
+        if len(queries) == 1:
+            return queries[0]
+        else:
+            return ParallelizedQuery(queries, original=self, **kwargs)
 
 
 class ParallelizedQuery(object):
@@ -187,8 +197,13 @@ class ParallelizedQuery(object):
         self._preprocess_result = preprocess_result
         self._pool = pool
         self._limit = None
+        self._received = 0
         self._seen = 0
+        self._sent = 0
         self._stop = False
+        self._check_every = 10
+        self._max_waiting_coefficient = 5
+        self._executing = []
         self.__pool = None
         self.__tasks = None
 
@@ -205,6 +220,7 @@ class ParallelizedQuery(object):
         return query_context
 
     def _spawn_callback_query_results(self, (input_query, callback)):
+        _, _, sleeper = self._backend
         if self._stop:
             return 
 
@@ -219,16 +235,25 @@ class ParallelizedQuery(object):
             result_callback = callback
 
         with self._spawnned_query_instance(input_query) as query:
+            query_idx = len(self._executing)
+            self._executing.append(query)
             results = iter(query)
+            num_queries = len(self.queries)
             for result in results:
+                self._received += 1
                 try:
                     preprocessed = self._preprocess_result(query, result)
                     result_callback(preprocessed)
+                    if self._stop:
+                        raise StopIteration
+                    elif self._received % self._check_every == 0:
+                        sleeper(0)
                 except StopIteration:
                     results.close()
                     self._terminate()
                     break
             callback(_QUERY_PART_DONE)
+            self._executing[query_idx] = None
     
     def _spawn_load_all_results(self, input_query):
         with self._spawnned_query_instance(input_query) as query:
@@ -246,12 +271,28 @@ class ParallelizedQuery(object):
         return wrapped
 
     def _terminate(self):
-        if self.__tasks:
-            self.__tasks.kill()
         self._stop = True
 
+    def _cleanup(self):
+        try:
+           self._spawned_pool.kill()
+        except Exception:
+            pass
+        try:
+            self._spawned_tasks.kill()
+        except Exception as e:
+            pass
+        for i, query in enumerate(self._executing):
+            if query is None:
+                continue
+            try:
+                query.session.bind.raw_connection().connection.cancel()
+            except Exception as e:
+                pass
+            	 
+
     def _spawner(self, target, args=None):
-        poolclass, _ = self._backend
+        poolclass, _, _ = self._backend
         if self._pool is None:
             pool = poolclass()
         elif isinstance(self._pool, int):
@@ -260,13 +301,14 @@ class ParallelizedQuery(object):
             pool = self._pool
         if args is None:
             args = self.queries
-        self.__pool = pool
+        self._spawned_pool = pool
         tasks = pool.imap_unordered(target, args)
-        self.__tasks = tasks
+        self._spawned_tasks = tasks
         def handler(thread):
             exc = thread.exception
             if exc in DONE_EXCEPTIONS:
                 self._terminate()
+                self._cleanup()
         tasks.link_exception(handler)
         return tasks, pool
 
@@ -278,14 +320,15 @@ class ParallelizedQuery(object):
                 else:
                     yield (query, callback)
         runner = self._spawn_callback_query_results
-        catcher = self._discard_errors(runner)
-        tasks, pool = self._spawner(catcher, gen_args())
+        #catcher = self._discard_errors(runner)
+        tasks, pool = self._spawner(runner, gen_args())
         return tasks, pool
 
     def _queue_spawner(self):
-        _, queueclass = self._backend
-        results = queueclass()
+        _, queueclass, _ = self._backend
+        results = queueclass(self._max_waiting_coefficient * len(self.queries))
         tasks, pool = self._spawn_with_callback(results.put)
+        self._spawn_results = results
         return tasks, results, pool
 
     def all_per_query(self):
@@ -302,9 +345,12 @@ class ParallelizedQuery(object):
 
     def _iter_queue(self):
         finished = 0
-        sent = 0
+        self._sent = 0
         expected = self._num_query_parts()
-        tasks, results, pool = self._queue_spawner()
+        self._spawned_impl = self._queue_spawner()
+        tasks, results, pool = self._spawned_impl
+        _, _, sleeper = self._backend
+        NO_ITEM = object()
         while True:
             try:
                 if finished >= expected:
@@ -314,18 +360,31 @@ class ParallelizedQuery(object):
                 item = results.get()
                 if item is _QUERY_PART_DONE:
                     finished += 1
-                    
+                    sleeper(0)
                     continue
                 elif self._limit is not None:
-                    if sent <= self._limit:
-                        sent += 1
+                    if self._sent <= self._limit:
+                        self._sent += 1
                     else:
                         break
-                yield item
+                    self._stop = self._sent >= self._limit
+                else:
+                    self._sent += 1
+                    while len(results.queue) >= results.maxsize:
+                        yield item
+                        item = results.get()
+                        self._sent += 1
+                if not self._stop:
+                    yield item
+                    item = NO_ITEM
+                if self._sent % self._check_every == 0:
+                    sleeper(0)
             except DONE_EXCEPTIONS as e:
                 break
-        tasks.kill()
-        pool.kill()
+        self._cleanup()
+        if self._stop and item is not NO_ITEM:
+            yield item
+            item = NO_ITEM
 
     def _iter_normal(self):
         finished = 0
@@ -365,9 +424,28 @@ class ParallelizedQuery(object):
         return new
 
     def limit(self, limit):
+        new = self.new_with_parallel_config(self.queries, _limit=limit)
+        return new
+
+    def limit_children(self, limit):
         new = self._apply_over_queries('limit', limit, 
                                        init_kwargs={'_limit': limit})
         return new
+
+
+    def first(self):
+        results = iter(self.limit(1))
+        found = next(results, None)
+        return found
+
+    def one(self):
+        results = iter(self.limit(1))
+        try:
+            found = next(results)
+            return found
+        except StopIteration:
+            raise NoResultFound
+
 
     def _apply_over_queries(self, name, *args, **kwargs):
         init_kwargs = kwargs.pop('init_kwargs', {})
