@@ -187,7 +187,7 @@ class ParallelizedQuery(object):
         self._seen = 0
         self._sent = 0
         self._stop = False
-        self._check_every = 10
+        self._check_every = 100
         self._max_waiting_coefficient = 5
         self._executing = []
         self.__pool = None
@@ -346,6 +346,7 @@ class ParallelizedQuery(object):
                     break
                 item = results.get()
                 if item is _QUERY_PART_DONE:
+                    item = NO_ITEM
                     finished += 1
                     sleeper(0)
                     continue
@@ -359,9 +360,14 @@ class ParallelizedQuery(object):
                     self._sent += 1
                     while len(results.queue) >= results.maxsize:
                         yield item
-                        item = results.get()
                         self._sent += 1
-                if not self._stop:
+                        item = results.get()
+                        if item is _QUERY_PART_DONE:
+                            item = NO_ITEM
+                            finished += 1
+                            sleeper(0)
+                            break
+                if not self._stop and item is not NO_ITEM:
                     yield item
                     item = NO_ITEM
                 if self._sent % self._check_every == 0:
