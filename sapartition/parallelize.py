@@ -183,6 +183,7 @@ class ParallelizedQuery(object):
 
         self._preprocess_result = preprocess_result
         self._pool = pool
+        self._skip = None
         self._limit = None
         self._post_sort = False
         self._sort_columns = 0
@@ -420,12 +421,18 @@ class ParallelizedQuery(object):
         return self.original_query.session
 
     def slice(self, start, size):
-        new = self._apply_over_queries('slice', start, size, 
-                                       init_kwargs={'_limit': size})
+        new = self._apply_over_queries('slice', start, size, init_kwargs={
+            '_limit': size,
+            '_skip': start,
+        })
         return new
 
     def limit(self, limit):
         new = self.new_with_parallel_config(self.queries, _limit=limit)
+        return new
+
+    def offset(self, offset):
+        new = self.new_with_parallel_config(self.queries, _skip=offset)
         return new
 
     def order_by(self, *args):
@@ -438,7 +445,7 @@ class ParallelizedQuery(object):
 
     def force_sort(self, sort=True):
         if sort and hasattr(self.original_query, '_order_by'):
-            sort_clauses = list(self.original_query._order_by)
+            sort_clauses = [getattr(item, 'element', item) for item in self.original_query._order_by]
             if hasattr(self.original_query, 'annotate'):
                 keys = ['_parallel_query_sort_clause_{}'.format(idx) for idx in range(len(sort_clauses))]
                 sort_columns = keys
@@ -509,8 +516,12 @@ class ParallelizedQuery(object):
             for key, row in sorted(keyed, key=operator.itemgetter(0)):
                 yield row
         it = gen()
-        if self._limit is not None:
-            it = list(it)[:self._limit]
+        if self._limit is not None or self._skip is not None:
+            start = self._skip or 0
+            end = self._limit + start
+            chunk = slice(start, end)
+            it = list(it)
+            it = it[chunk]
         return it
         
     def __getattr__(self, name):
