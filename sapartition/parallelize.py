@@ -1,6 +1,7 @@
 from __future__ import division
 import contextlib
 import itertools
+import operator
 
 from sqlalchemy import func
 from sqlalchemy.orm.exc import (
@@ -183,6 +184,8 @@ class ParallelizedQuery(object):
         self._preprocess_result = preprocess_result
         self._pool = pool
         self._limit = None
+        self._post_sort = False
+        self._sort_columns = 0
         self._received = 0
         self._seen = 0
         self._sent = 0
@@ -210,7 +213,7 @@ class ParallelizedQuery(object):
         if self._stop:
             return 
 
-        if self._limit is not None:
+        if self._limit is not None and not self._post_sort:
             def counting_callback(result):
                 if self._seen >= self._limit:
                     raise StopIteration
@@ -350,7 +353,7 @@ class ParallelizedQuery(object):
                     finished += 1
                     sleeper(0)
                     continue
-                elif self._limit is not None:
+                elif self._limit is not None and not self._post_sort:
                     if self._sent <= self._limit:
                         self._sent += 1
                     else:
@@ -396,6 +399,8 @@ class ParallelizedQuery(object):
             it = self._iter_queue()
         if self._swap_to_original_session:
             it = (self.session.merge(result, load=False) for result in it)
+        if self._post_sort:
+            it = iter(self._sorted_results(it))
         return it
 
     def new_with_parallel_config(self, queries, original_query=None, **kwargs):
@@ -423,6 +428,38 @@ class ParallelizedQuery(object):
         new = self.new_with_parallel_config(self.queries, _limit=limit)
         return new
 
+    def order_by(self, *args):
+        new = self._apply_over_queries('order_by', *args, init_kwargs={
+            '_post_sort': True,
+            'original_query': self.original_query.order_by(*args),
+        })
+        newer = new.force_sort()
+        return newer
+
+    def force_sort(self, sort=True):
+        if sort and hasattr(self.original_query, '_order_by'):
+            sort_clauses = list(self.original_query._order_by)
+            if hasattr(self.original_query, 'annotate'):
+                keys = ['_parallel_query_sort_clause_{}'.format(idx) for idx in range(len(sort_clauses))]
+                sort_columns = keys
+                def transform(query):
+                    for key, clause in zip(keys, sort_clauses):
+                        query = query.annotate(key, clause)
+                    return query
+            else:
+                sort_columns = len(sort_clauses)
+                def transform(query):
+                    for clause in sort_clauses:
+                            query = query.add_column(clause)
+                    return query
+            new = self._apply_over_queries('with_transformation', transform, init_kwargs={
+                '_post_sort': True,
+                '_sort_columns': sort_columns,
+		})
+            return new
+        else:
+            return self.new_with_parallel_config(self.queries)
+
     def limit_children(self, limit):
         new = self._apply_over_queries('limit', limit, 
                                        init_kwargs={'_limit': limit})
@@ -442,7 +479,6 @@ class ParallelizedQuery(object):
         except StopIteration:
             raise NoResultFound
 
-
     def _apply_over_queries(self, name, *args, **kwargs):
         init_kwargs = kwargs.pop('init_kwargs', {})
         apply_proxy = lambda q: getattr(q, name)(*args, **kwargs)
@@ -453,6 +489,30 @@ class ParallelizedQuery(object):
         parallel_query = self.new_with_parallel_config(queries, original_query, **init_kwargs)
         return parallel_query
 
+    def _sorted_results(self, incomming):
+        columns = self._sort_columns
+        if isinstance(columns, int):
+            assert columns > 0
+            split_key = lambda row: (row[-columns:], row[:-columns])
+        elif isinstance(columns, list):
+            assert len(columns) > 0
+            def split_key(item):
+                key = []
+                for column in columns:
+                    key.append(getattr(item, column))
+                    delattr(item, column)
+                return tuple(key), item
+        else:
+            raise ValueError("Invalid post-sort column definition")
+        def gen():
+            keyed = (split_key(row) for row in incomming)
+            for key, row in sorted(keyed, key=operator.itemgetter(0)):
+                yield row
+        it = gen()
+        if self._limit is not None:
+            it = list(it)[:self._limit]
+        return it
+        
     def __getattr__(self, name):
         if not hasattr(self.original_query, name):
             raise AttributeError("{} not available in original query. Will not map over query parts".format(name))
