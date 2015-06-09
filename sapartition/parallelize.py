@@ -300,7 +300,8 @@ class ParallelizedQuery(object):
             if exc in DONE_EXCEPTIONS:
                 self._terminate()
                 self._cleanup()
-        tasks.link_exception(handler)
+        if hasattr(tasks, 'link_exception'):
+            tasks.link_exception(handler)
         return tasks, pool
 
     def _spawn_with_callback(self, callback):
