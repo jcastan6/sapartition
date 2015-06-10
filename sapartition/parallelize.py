@@ -444,7 +444,7 @@ class ParallelizedQuery(object):
         newer = new.force_sort()
         return newer
 
-    def force_sort(self, sort=True):
+    def force_sort(self, sort=True, max_results=None):
         if sort and hasattr(self.original_query, '_order_by'):
             sort_clauses = [getattr(item, 'element', item) for item in self.original_query._order_by]
             if hasattr(self.original_query, 'annotate'):
@@ -460,10 +460,13 @@ class ParallelizedQuery(object):
                     for clause in sort_clauses:
                             query = query.add_column(clause)
                     return query
-            new = self._apply_over_queries('with_transformation', transform, init_kwargs={
+            init_kwargs = {
                 '_post_sort': True,
                 '_sort_columns': sort_columns,
-		})
+            }
+            new = self._apply_over_queries('with_transformation', transform, init_kwargs=init_kwargs)
+            if max_results is not None:
+                new = new.limit_children(max_results)
             return new
         else:
             return self.new_with_parallel_config(self.queries)
