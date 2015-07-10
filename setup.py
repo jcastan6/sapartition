@@ -3,7 +3,7 @@
 from setuptools import setup, find_packages
 
 setup(name='sapartition',
-      version='0.0.3',
+      version='0.0.4',
       description='Table partition and query splitting for SQLAlchemy',
       packages=['sapartition'],
       install_requires=[
