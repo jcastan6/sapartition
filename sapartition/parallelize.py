@@ -4,6 +4,7 @@ import itertools
 import operator
 
 from sqlalchemy import func
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm.exc import (
     NoResultFound,
     MultipleResultsFound,
@@ -16,8 +17,10 @@ from sqlalchemy.orm.exc import (
 BACKENDS = {}
 DEFAULT_BACKEND = None
 
-DONE_EXCEPTIONS = (StopIteration,)
+DONE_EXCEPTIONS = (StopIteration, OperationalError)
 _QUERY_PART_DONE = object()
+
+TIMEOUT_EXCEPTIONS = (OperationalError, )
 
 try:
     import time
@@ -39,12 +42,17 @@ try:
     from gevent.queue import Queue as GeventQueue
     from gevent.hub import LoopExit as GeventLoopExit
     DONE_EXCEPTIONS += (GeventLoopExit,)
+    TIMEOUT_EXCEPTIONS += (gevent.Timeout,)
     GEVENT_BACKEND = (GeventPool, GeventQueue, gevent.sleep)
     BACKENDS['gevent'] = GEVENT_BACKEND
     if 'socket' in gevent_patched or 'sys' in gevent_patched:
         DEFAULT_BACKEND = GEVENT_BACKEND
 except ImportError:
     GEVENT_BACKEND = None
+
+
+class ParallelQueryTimeoutError(Exception):
+    pass
 
 
 @contextlib.contextmanager
@@ -185,6 +193,7 @@ class ParallelizedQuery(object):
         self._pool = pool
         self._skip = None
         self._limit = None
+        self._timeout = None
         self._post_sort = False
         self._sort_columns = 0
         self._received = 0
@@ -196,6 +205,7 @@ class ParallelizedQuery(object):
         self._executing = []
         self.__pool = None
         self.__tasks = None
+        self._failed = None
 
     def _num_query_parts(self):
         return len(self.queries)
@@ -229,22 +239,29 @@ class ParallelizedQuery(object):
             self._executing.append(query)
             results = iter(query)
             num_queries = len(self.queries)
-            for result in results:
-                self._received += 1
-                try:
-                    preprocessed = self._preprocess_result(query, result)
-                    result_callback(preprocessed)
-                    if self._stop:
-                        raise StopIteration
-                    elif self._received % self._check_every == 0:
-                        sleeper(0)
-                except StopIteration:
-                    results.close()
-                    self._terminate()
-                    break
-            callback(_QUERY_PART_DONE)
-            self._executing[query_idx] = None
-            query.session.expunge_all()
+            try:
+                for result in results:
+                    self._received += 1
+                    try:
+                        preprocessed = self._preprocess_result(query, result)
+                        result_callback(preprocessed)
+                        if self._stop:
+                            raise StopIteration
+                        elif self._received % self._check_every == 0:
+                            sleeper(0)
+                    except StopIteration:
+                        results.close()
+                        self._terminate()
+                        break
+                callback(_QUERY_PART_DONE)
+            except OperationalError as e:
+                if 'timeout' in str(e).lower():
+                    self._terminate(failed=True)
+                else:
+                    raise
+            finally:
+                self._executing[query_idx] = None
+                query.session.expunge_all()
     
     def _spawn_load_all_results(self, input_query):
         with self._spawnned_query_instance(input_query) as query:
@@ -261,8 +278,21 @@ class ParallelizedQuery(object):
                 pass
         return wrapped
 
-    def _terminate(self):
+    def _terminate(self, failed=None):
+        self._failed = failed
         self._stop = True
+
+    def _trigger_timeout(self):
+        timeout = self._get_timeout_value()
+        if timeout is None:
+            return None
+
+        sleeper = self._backend[2]
+        sleeper(timeout)
+
+        if not self._stop:
+            self._terminate(failed=ParallelQueryTimeoutError())
+            self._cleanup()
 
     def _cleanup(self):
         try:
@@ -280,9 +310,8 @@ class ParallelizedQuery(object):
                 query.session.bind.raw_connection().connection.cancel()
             except Exception as e:
                 pass
-            	 
 
-    def _spawner(self, target, args=None):
+    def _spawner(self, target, args=None, before=(), after=()):
         poolclass, _, _ = self._backend
         if self._pool is None:
             pool = poolclass()
@@ -293,7 +322,11 @@ class ParallelizedQuery(object):
         if args is None:
             args = self.queries
         self._spawned_pool = pool
+
+        pretasks = [pool.spawn(*before_task) for before_task in before]
         tasks = pool.imap_unordered(target, args)
+        posttasks = [pool.spawn(*after_task) for after_task in after]
+        tasks = itertools.chain(pretasks, tasks, posttasks)
         self._spawned_tasks = tasks
         def handler(thread):
             exc = thread.exception
@@ -305,15 +338,21 @@ class ParallelizedQuery(object):
         return tasks, pool
 
     def _spawn_with_callback(self, callback):
+        if self._timeout is not None:
+            timeout_task = [(self._trigger_timeout,)]
+        else:
+            timeout_task = []
+
         def gen_args():
             for query in self.queries:
                 if self._stop:
                     break
                 else:
                     yield (query, callback)
+
         runner = self._spawn_callback_query_results
         #catcher = self._discard_errors(runner)
-        tasks, pool = self._spawner(runner, gen_args())
+        tasks, pool = self._spawner(runner, gen_args(), before=timeout_task)
         return tasks, pool
 
     def _queue_spawner(self):
@@ -335,6 +374,19 @@ class ParallelizedQuery(object):
         tasks, results, pool = self._queue_spawner()
         return results
 
+    def _get_timeout_value(self):
+        timeout = self._timeout
+        if timeout is None:
+            return None
+        elif isinstance(timeout, basestring):
+            if timeout.endswith('ms'):
+                timeout = float(timeout[:-2] / 100)
+            elif timeout.endswith('s'):
+                timeout = float(timeout[:-1])
+
+        timeout = float(timeout)
+        return timeout
+
     def _iter_queue(self):
         finished = 0
         self._sent = 0
@@ -343,13 +395,18 @@ class ParallelizedQuery(object):
         tasks, results, pool = self._spawned_impl
         _, _, sleeper = self._backend
         NO_ITEM = object()
+        item = NO_ITEM
+        timeout = self._get_timeout_value()
         while True:
             try:
                 if finished >= expected:
                     break
                 elif self._stop:
                     break
-                item = results.get()
+                if timeout is None:
+                    item = results.get()
+                else:
+                    item = results.get(timeout=timeout)
                 if item is _QUERY_PART_DONE:
                     item = NO_ITEM
                     finished += 1
@@ -379,7 +436,11 @@ class ParallelizedQuery(object):
                     sleeper(0)
             except DONE_EXCEPTIONS as e:
                 break
+            except TIMEOUT_EXCEPTIONS as e:
+                raise ParallelQueryTimeoutError()
         self._cleanup()
+        if self._failed:
+            raise self._failed
         if self._stop and item is not NO_ITEM:
             yield item
             item = NO_ITEM
@@ -445,7 +506,7 @@ class ParallelizedQuery(object):
         return newer
 
     def force_sort(self, sort=True, max_results=None):
-        if sort and hasattr(self.original_query, '_order_by'):
+        if sort and getattr(self.original_query, '_order_by', False):
             sort_clauses = [getattr(item, 'element', item) for item in self.original_query._order_by]
             if hasattr(self.original_query, 'annotate'):
                 keys = ['_parallel_query_sort_clause_{}'.format(idx) for idx in range(len(sort_clauses))]
@@ -476,7 +537,6 @@ class ParallelizedQuery(object):
                                        init_kwargs={'_limit': limit})
         return new
 
-
     def first(self):
         results = iter(self.limit(1))
         found = next(results, None)
@@ -499,6 +559,13 @@ class ParallelizedQuery(object):
             queries.append(apply_proxy(query))
         parallel_query = self.new_with_parallel_config(queries, original_query, **init_kwargs)
         return parallel_query
+
+    def set_timeout(self, timeout):
+        if isinstance(timeout, int):
+            timeout = '{}s'.format(timeout)
+        new = self._apply_over_queries('set_timeout', timeout,
+                                       init_kwargs={'_timeout': timeout})
+        return new
 
     def _sorted_results(self, incomming):
         columns = self._sort_columns
