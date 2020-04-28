@@ -1,4 +1,4 @@
-from __future__ import division
+
 import contextlib
 import itertools
 import operator
@@ -25,8 +25,8 @@ TIMEOUT_EXCEPTIONS = (OperationalError, )
 try:
     import time
     from multiprocessing.pool import ThreadPool
-    from Queue import Queue as ThreadQueue
-    from Queue import Empty as ThreadQueueEmpty
+    from queue import Queue as ThreadQueue
+    from queue import Empty as ThreadQueueEmpty
     DONE_EXCEPTIONS += (ThreadQueueEmpty,)
     THREADING_BACKEND = (ThreadPool, ThreadQueue, time.sleep)
     BACKENDS['threading'] = THREADING_BACKEND
@@ -72,11 +72,11 @@ def pairwise(iterable):
     "s -> (s0,s1), (s1,s2), (s2, s3), ..."
     a, b = itertools.tee(iterable)
     next(b, None)
-    return zip(a, b)
+    return list(zip(a, b))
 
 
 def bounds_range(*args):
-    the_range = range(*args)
+    the_range = list(range(*args))
     return pairwise(the_range)
     
     
@@ -219,7 +219,8 @@ class ParallelizedQuery(object):
             query_context = self._spawn_contextmanager(query)
         return query_context
 
-    def _spawn_callback_query_results(self, (input_query, callback)):
+    def _spawn_callback_query_results(self, xxx_todo_changeme):
+        (input_query, callback) = xxx_todo_changeme
         _, _, sleeper = self._backend
         if self._stop:
             return 
@@ -378,7 +379,7 @@ class ParallelizedQuery(object):
         timeout = self._timeout
         if timeout is None:
             return None
-        elif isinstance(timeout, basestring):
+        elif isinstance(timeout, str):
             if timeout.endswith('ms'):
                 timeout = float(timeout[:-2] / 100)
             elif timeout.endswith('s'):

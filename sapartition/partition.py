@@ -29,7 +29,7 @@ def replace(old, new):
                         '_criterion': replacement_traverse(query.__dict__['_criterion'], {}, replacer),
                         '_from_obj': tuple(replacement_traverse(fo, {}, replacer) for fo in query.__dict__['_from_obj']),
                         '_join_entities': tuple(new_mapper if ent is old_mapper else ent for ent in query.__dict__['_join_entities']),
-                        '_joinpoint': {k: new if v is old else v for k,v in query.__dict__['_joinpoint'].items()},
+                        '_joinpoint': {k: new if v is old else v for k,v in list(query.__dict__['_joinpoint'].items())},
                 })
                 return query
         return transform
@@ -61,7 +61,7 @@ def replace_entity(old_cls, new_cls):
     def transform(original):
         query = original.with_transformation(replace_table(old_table, new_table))
         join_entities = tuple(new_map if ent is old_map else ent for ent in query._join_entities)
-        joinpoint = dict((k, new_cls if v is old_cls else v) for k, v in query._joinpoint.items())
+        joinpoint = dict((k, new_cls if v is old_cls else v) for k, v in list(query._joinpoint.items()))
 
         # Apply replacements to internal query structure
         query.__dict__.update(_join_entities=join_entities,
@@ -102,7 +102,7 @@ def _find_subelement_replacements(element, tables_with_new=True, parameters_with
     names = set()
     if hasattr(element, 'params') and parameters_with_values:
         parameters_with_values = False
-        for name, value in element.compile().params.items():
+        for name, value in list(element.compile().params.items()):
             replacement = (":{}".format(name), " {!r} ".format(value))
             names.add(replacement)
         if len(names) == 0:
@@ -232,7 +232,7 @@ class Partitioned(object):
                 try:
                     raw_constraint = raw_constraint(partition)
                 except TypeError:
-                    raw_constraint = raw_constraint.im_func(partition)  # Force raw call
+                    raw_constraint = raw_constraint.__func__(partition)  # Force raw call
 
             constraint_name = "cst_" + partition_table + "_partition"
             constraint_clause = CheckConstraint(raw_constraint, name=constraint_name)
@@ -262,13 +262,13 @@ class Partitioned(object):
     @classmethod
     def partitions(cls):
         cls.load_partitions()
-        return cls.__partitions__.values()
+        return list(cls.__partitions__.values())
 
     # TODO: Replace with custom DDL hooks
     @classmethod
     def create_insert_trigger_ddl(cls):
         cls.load_partitions()
-        if all(part.__partitionconstraint__ is None for part in cls.__partitions__.values()):
+        if all(part.__partitionconstraint__ is None for part in list(cls.__partitions__.values())):
             return None
         
         parent_table = cls.__tablename__
@@ -283,7 +283,7 @@ class Partitioned(object):
         """.format(fn=function_name)
         trigger_checks = []
         first = True
-        for partition in cls.__partitions__.values():
+        for partition in list(cls.__partitions__.values()):
             if partition.__partitionconstraint__ is None:
                 continue
             if first:
@@ -393,9 +393,9 @@ def test():
 
         
     for part in Fingerprint.partitions():
-        print part.get_create_ddl()
+        print(part.get_create_ddl())
 
-    print
+    print()
     session = Session()
 
     for partition in Fingerprint.partitions():
@@ -403,10 +403,10 @@ def test():
                    .join(FingerprintId)\
                    .join(partition)\
                    .filter(partition.ecfp4 % 'bla')
-        print q
-        print
+        print(q)
+        print()
 
-    print Fingerprint.create_insert_trigger_ddl()
+    print(Fingerprint.create_insert_trigger_ddl())
 
     return Substance, FingerprintId, Fingerprint
 

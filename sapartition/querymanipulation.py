@@ -10,7 +10,7 @@ def replace(old, new):
                         '_criterion': replacement_traverse(query.__dict__['_criterion'], {}, replacer),
                         '_from_obj': tuple(replacement_traverse(fo, {}, replacer) for fo in query.__dict__['_from_obj']),
                         '_join_entities': tuple(new_mapper if ent is old_mapper else ent for ent in query.__dict__['_join_entities']),
-                        '_joinpoint': {k: new if v is old else v for k,v in query.__dict__['_joinpoint'].items()},
+                        '_joinpoint': {k: new if v is old else v for k,v in list(query.__dict__['_joinpoint'].items())},
                 })
                 return query
         return transform
@@ -46,7 +46,7 @@ def replace_entity(old_cls, new_cls):
     def transform(original):
         query = original.with_transformation(replace_table(old_table, new_table))
         join_entities = tuple(new_map if ent is old_map else ent for ent in query._join_entities)
-        joinpoint = dict((k, new_cls if v is old_cls else v) for k, v in query._joinpoint.items())
+        joinpoint = dict((k, new_cls if v is old_cls else v) for k, v in list(query._joinpoint.items()))
 
         # Apply replacements to internal query structure
         query.__dict__.update(_join_entities=join_entities,
