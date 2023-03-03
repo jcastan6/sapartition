@@ -324,9 +324,9 @@ class ParallelizedQuery(object):
             args = self.queries
         self._spawned_pool = pool
 
-        pretasks = [pool.spawn(*before_task) for before_task in before]
+        pretasks = [pool.apply_async(*before_task) for before_task in before]
         tasks = pool.imap_unordered(target, args)
-        posttasks = [pool.spawn(*after_task) for after_task in after]
+        posttasks = [pool.apply_async(*after_task) for after_task in after]
         tasks = itertools.chain(pretasks, tasks, posttasks)
         self._spawned_tasks = tasks
         def handler(thread):
